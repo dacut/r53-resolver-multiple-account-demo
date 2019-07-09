@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""\
+Usage: add_cross_account_phz [options]
+Add a Route 53 Private Hosted Zone to a VPC in another account.
+
+Resolver account refers to the account owning the Route 53 private hosted zone.
+Target account refers to the account owning the VPC which the private hosted
+zone will be attached to.
+
+Options:
+    -h | --help
+        Show this usage information.
+    
+    --resolver-profile <profile>
+    --target-profile <profile>
+        Use the specified profile for getting AWS credentials in the resolver
+        or target account, respectively.
+
+    --target-vpc-id <vpc_id>
+        The id of the VPC which the private hosted zone will be attached to.
+        This is required.
+
+    --target-vpc-region <region>
+        The region in which the VPC exists. This is required.
+
+    --zone-id <route53_zone_id>
+        The Route 53 private hosted zone id to associate with the VPC. This
+        is required.
+
+Access keys, secret keys, and session tokens for the resolver and target
+accounts can be specified using the following environment variables:
+RESOLVER_AWS_ACCESS_KEY_ID          TARGET_AWS_ACCESS_KEY_ID
+RESOLVER_AWS_SECRET_ACCESS_KEY      TARGET_AWS_SECRET_ACCESS_KEY
+RESOLVER_AWS_SESSION_TOKEN          TARGET_AWS_SESSION_TOKEN
+"""
+from getopt import getopt, GetoptError
+from os import environ
+from sys import argv, exit, stderr, stdout
+from time import sleep
+from boto3.session import Session
+
+def parse_args(args):
+    result = {
+        "resolver_boto_kw": {},
+        "target_boto_kw": {},
+    }
+
+    opts, args = getopt(
+        args, "h",
+        ["help", "resolver-profile=", "target-profile=", "target-vpc-id=",
+            "target-vpc-region=", "zone-id="])
+
+    for opt, val in opts:
+        if opt in ("-h", "--help",):
+            usage(stdout)
+            return 0
+        if opt == "--resolver-profile":
+            result["resolver_boto_kw"]["profile_name"] = val
+        if opt == "--target-profile":
+            result["target_boto_kw"]["profile_name"] = val
+        else:
+            result[opt[2:].replace("-", "_")] = val
+
+    if args:
+        raise GetoptError(f"Unknown argument {args[0]}")
+    
+    if not result.get("target_vpc_id"):
+        raise GetoptError("--target-vpc-id must be specified")
+    
+    if not result.get("target_vpc_region"):
+        raise GetoptError("--target-vpc-region must be specified")
+    
+    if not result.get("zone_id"):
+        raise GetoptError("--zone-id must be specified")
+    
+    return result
+    
+def get_session_args_from_environ(prefix):
+    result = {}
+
+    if prefix + "AWS_ACCESS_KEY_ID" in environ:
+        result["aws_access_key_id"] = environ[prefix + "AWS_ACCESS_KEY_ID"]
+    if prefix + "AWS_SECRET_ACCESS_KEY" in environ:
+        result["aws_secret_access_key"] = environ[prefix + "AWS_SECRET_ACCESS_KEY"]
+    if prefix + "AWS_SESSION_TOKEN" in environ:
+        result["aws_session_token"] = environ[prefix + "AWS_SESSION_TOKEN"]
+    
+    return result
+
+def main(args):
+    try:
+        opts = parse_args(args)
+    except GetoptError as e:
+        print(str(e), file=stderr)
+        usage()
+        return 2
+    
+    opts["resolver_boto_kw"].update(get_session_args_from_environ("RESOLVER_"))
+    opts["target_boto_kw"].update(get_session_args_from_environ("TARGET_"))
+
+    resolver_boto = Session(**opts["resolver_boto_kw"])
+    target_boto = Session(**opts["target_boto_kw"])
+
+    resolver_route53 = resolver_boto.client("route53")
+    target_route53 = target_boto.client("route53")
+
+    vpc = {
+        "VPCRegion": opts["target_vpc_region"],
+        "VPCId": opts["target_vpc_id"]
+    }
+
+    # Add the VPC to the authorized list.
+    print(f"Authorizing VPC {opts['target_vpc_id']} to be associated with "
+          f"zone {opts['zone_id']}...", end="")
+    resolver_route53.create_vpc_association_authorization(
+        HostedZoneId=opts["zone_id"], VPC=vpc)
+    print(" done.")
+    
+    # Associate the VPC
+    print(f"Associating VPC {opts['target_vpc_id']} with zone "
+          f"{opts['zone_id']}...", end="")
+    result = target_route53.associate_vpc_with_hosted_zone(
+        HostedZoneId=opts["zone_id"], VPC=vpc)
+
+    change_id = result["ChangeInfo"]["Id"]
+    while result["ChangeInfo"]["Status"] == "PENDING":
+        print(".", end="")
+        sleep(5)
+        result = resolver_route53.get_change(Id=change_id)
+    
+    if result["ChangeInfo"]["Status"] != "INSYNC":
+        print(f" failed: status {result['CHangeInfo']['Status']}")
+        return 1
+    else:
+        print(" done.")
+    
+    return 0
+
+def usage(fd=stderr):
+    fd.write(__doc__)
+
+if __name__ == "__main__":
+    exit(main(argv[1:]))
